@@ -1,10 +1,30 @@
 #!/usr/bin/perl
-
-########################################
 #
-# Try to match card <-> ibswitch_port
+#
+#                  _ _           
+#                 (_) |          
+#                  _| |__   __ _ 
+#                 | | '_ \ / _` |
+#                 | | |_) | (_| |
+#                 |_|_.__/ \__, |
+#                             | |
+#                             |_|
+#
+# This program is free software: you can redistribute it and/or modify
+#    it under the terms of the GNU General Public License version 2 as published by
+#    the Free Software Foundation.
+#
+#    This program is distributed in the hope that it will be useful,
+#    but WITHOUT ANY WARRANTY; without even the implied warranty of
+#    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+#    GNU General Public License for more details.
+#
+#    You should have received a copy of the GNU General Public License
+#    along with this program.  If not, see <http://www.gnu.org/licenses/>.
 #
 # (C) 2010-2012 Adrian Ulrich / ETH Zurich
+#
+##########################################
 #
 #
 # Changelog:
@@ -26,7 +46,7 @@ use Data::Dumper;
 
 use constant FAILBACK_GUID => 0xb4df00d00;
 use constant FAILBACK_CXP  => 0xb4df00d;
-use constant VERSIONINFO   => 'ibq 0.92 - (C) 2010-2011 Adrian Ulrich / ETH Zurich';
+use constant VERSIONINFO   => 'ibq 0.92 - (C) 2010-2012 Adrian Ulrich / ETH Zurich';
 
 
 my $opts      = {};
@@ -65,6 +85,12 @@ usage: ibq [options]
                        Example: --forceswitch="DCS 648"
  --diff OLD NEW      : Report new, moved and missing hosts
  --diff OLD          : Same as above, but run ibnetdiscover to diff OLD <-> CURRENT
+
+
+
+Report bugs to <adrian.ulrich\@id.ethz.ch>
+The latest version of `ibq' can be found at https://github.com/adrian-bl/ibq
+
 EOF
 }
 
