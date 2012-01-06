@@ -1,0 +1,741 @@
+#!/usr/bin/perl
+
+########################################
+#
+# Try to match card <-> ibswitch_port
+#
+# (C) 2010 Adrian Ulrich / ETH Zurich
+#
+#
+# Changelog:
+#
+# 2010-02-08   Adrian  : Version 0.84
+#                        - Removed hardcoded LC_LAYOUT list. We build it ourself
+#                          while running ibnetdiscover
+# 2010-03-12   Adrian  : Support for multiple switchtypes
+# 2010-05-05   Adrian  : --diff support
+# 2010-09-10   Adrian  : Relaxed parser regexp (for CentOS 5.5)
+# 2010-09-27   Adrian  : Added --dumphosts option
+# 2011-08-18   Adrian  : Add support for multiple switches on same network (VERY alpha!)
+
+use strict;
+use Getopt::Long;
+use Data::Dumper;
+
+use constant FAILBACK_GUID => 0xb4df00d00;
+use constant FAILBACK_CXP  => 0xb4df00d;
+use constant VERSIONINFO   => 'ibq 0.90 - (C) 2010-2011 Adrian Ulrich / ETH Zurich';
+
+
+my $opts      = {};
+my @data      = ();
+GetOptions($opts, 'debug', 'port=s@', 'host=s@', 'matrix:s', 'format=s',
+                   'source=s', 'diff', 'dumphosts', 'forceswitch=s',
+                   'help', 'version');
+
+
+if($opts->{version}) {
+	die VERSIONINFO."\n";
+}
+elsif($opts->{help}) {
+die << "EOF";
+usage: ibq [options]
+
+ --port=PORTNAME     : return hosts connected to this port
+                       syntax: {linecard}{A|B}{col}
+                       example: 3B11
+ --host=HOSTNAME     : return switchport of this host
+ --matrix=[type]     : return switch overview
+                       type can be:
+                         reverse  (use reverse hack)
+                         hosts    (hostnames as reported by ib, default)
+                         brief    (display connected cables)
+ --dumphosts         : Display GUID information of all connected hosts
+ --format            : output format, valid values are asciiart, html and json.
+                       asciiart is the default
+ --help              : display this information and exit
+ --version           : display version information and exit
+ --debug             : printout debug information while running
+ --source            : 'ibnetdiscover -v' input. Can be empty, a file or '-'
+                       Note: all 'ibnetdiscover' input must have been generated
+                             on the same host as ibq is running on.
+ --forceswitch       : Disable switch autodetection, forces a specific switch model
+                       Example: --forceswitch="DCS 648"
+ --diff OLD NEW      : Report new, moved and missing hosts
+ --diff OLD          : Same as above, but run ibnetdiscover to diff OLD <-> CURRENT
+EOF
+}
+
+
+if( $opts->{diff} ) {
+	my $d_ref_o   = parse_ibnetdiscover( $ARGV[0] );
+	my $d_ref_n   = parse_ibnetdiscover( $ARGV[1] ); # can be null -> will trigger ibnetdiscover -v run
+	my $all_hosts = {};
+	my $differ    = {};
+	my $report    = {};
+	
+	map( $all_hosts->{$_}=defined, (keys(%{$d_ref_o->{hostnames}}),keys(%{$d_ref_n->{hostnames}})) ); # unique names of all known hosts
+	
+	# merge host data into $differ:
+	map( push(@{$differ->{$_}}, $d_ref_o->{hostnames}->{$_} || undef), keys(%$all_hosts) );
+	map( push(@{$differ->{$_}}, $d_ref_n->{hostnames}->{$_} || undef), keys(%$all_hosts) );
+	
+	# ..and start to search for differences:
+	foreach my $this_hostname (keys(%$differ)) {
+		my($old, $new) = @{$differ->{$this_hostname}}; # will always have two elements.. one of them is undef at worst..
+		if(! defined($old) ) {
+			$report->{new}->{$this_hostname} = 1;
+		}
+		elsif(! defined($new) ) {
+			$report->{missing}->{$this_hostname} = 1;
+		}
+		else {
+			
+			# check for any changes
+			my $dd_old = Data::Dumper->new([$old]);
+			my $dd_new = Data::Dumper->new([$new]);
+			$dd_old->Sortkeys(1);
+			$dd_new->Sortkeys(1);
+			$report->{moved}->{$this_hostname} = 1 if $dd_old->Dump ne $dd_new->Dump;
+		}
+	}
+	
+	if($report->{missing}) {
+		print "Missing hosts:\n";
+		print "--------------\n";
+		foreach my $missing_host (sort keys(%{$report->{missing}})) {
+			print " $missing_host  : ".get_short_portdesc(get_host($missing_host, $d_ref_o)->{target})."\n";
+		}
+		print "\n\n";
+	}
+	if($report->{new}) {
+		print "New hosts:\n";
+		print "--------------\n";
+		foreach my $new_host (sort keys(%{$report->{new}})) {
+			print " $new_host  : ".get_short_portdesc(get_host($new_host, $d_ref_n)->{target})."\n";
+		}
+		print "\n\n";
+	}
+	if($report->{moved}) {
+		print "Moved hosts:\n";
+		print "--------------\n";
+		foreach my $moved_host (sort keys(%{$report->{moved}})) {
+			my $loc_o = get_host($moved_host, $d_ref_o)->{target};
+			my $loc_n = get_host($moved_host, $d_ref_n)->{target};
+			print " $moved_host : ".get_short_portdesc($loc_o)." >>> ".get_short_portdesc($loc_n)."\n";
+		}
+		print "\n\n";
+	}
+	
+	
+	exit( ( keys(%$report) ? 1 : 0 ) );
+}
+
+
+# functios that need an ibcache:
+my $ibcache = parse_ibnetdiscover( $opts->{source} );
+if( $opts->{port} ) {
+	foreach my $portname (@{$opts->{port}}) {
+		push(@data, get_port($portname,$ibcache));
+	}
+}
+if( $opts->{host} ) {
+	foreach my $hostname (@{$opts->{host}}) {
+		push(@data, get_host($hostname, $ibcache));
+	}
+}
+if(exists $opts->{dumphosts} ) {
+	foreach my $hostname (keys(%{$ibcache->{hostnames}})) {
+		my $xref = get_host($hostname,$ibcache);
+		next unless exists($xref->{target});
+		while(my($k,$v) = each(%{$xref->{target}})) {
+			push(@data, {type=>'txt', txt=>$xref->{target}->{$k}->{info}});
+		}
+	}
+}
+if(exists $opts->{matrix} ) {
+	my $aliases = {};
+	   $aliases = _reverse_hack() if $opts->{matrix} eq 'reverse';
+	   $aliases = undef           if $opts->{matrix} eq 'brief';
+	push(@data, build_matrix($ibcache, $aliases));
+}
+
+
+if( int(@data) == 0 ) {
+	die "Nothing to do: use $0 --help for more information\n";
+}
+elsif( $opts->{format} eq 'json' ) {
+	die "Fixme: Not implemented yet\n";
+}
+elsif( $opts->{format} eq 'html') {
+	data_as_html(\@data);
+}
+else {
+	print data_as_ascii(\@data);
+}
+
+
+
+sub data_as_html {
+	my($dref) = @_;
+	
+	print '<html><head><title>ibq output</title></head><body>';
+	
+	foreach my $chunk (@$dref) {
+		if($chunk->{error}) {
+			print "<font color=red>$chunk->{error}</font>\n";
+		}
+		elsif($chunk->{type} eq 'matrix') {
+			print "<table border=1>\n";
+			
+			
+			
+		}
+	}
+	
+	print "</body></html>\n";
+	
+	
+}
+
+
+###########################################################
+# Printout ascii-art :-) (console mode)
+sub data_as_ascii {
+	my($dref) = @_;
+	
+	foreach my $chunk (@$dref) {
+		
+		if($chunk->{error}) {
+			warn $chunk->{error}."\n\n";
+		}
+		elsif($chunk->{type} eq 'portlist') {
+			print "# $chunk->{info}\n";
+			print "hosts connected to port $chunk->{source} = ".join(' ',@{$chunk->{target}})."\n";
+			print "\n";
+		}
+		elsif($chunk->{type} eq 'hostlist') {
+			print "# >> connections of $chunk->{source} <<\n";
+			foreach my $port (sort(keys(%{$chunk->{target}}))) {
+				my $pref = $chunk->{target}->{$port};
+				if($pref->{invalid}) {
+					print "# error: host not directly connected ($pref->{info})\n";
+				}
+				else {
+					print  "# $pref->{info}\n";
+					printf(" linecard guid          = 0x%x\n", $pref->{lc_guid});
+					printf(" switch-chip index      = %d (0x%x)\n", $pref->{swc_idx}, $pref->{swc_guid});
+					printf(" on-chip index          = %d (0x%x)\n", $pref->{chip_idx}, $pref->{switchport});
+					print  " physical linecard id   = $pref->{ph_lc}\n";
+					print  " linecard row           = $pref->{lc_row}\n";
+					print  " linecard port          = $pref->{lc_port}\n";
+					print  " cable color            = "._cc_print('X','[')._cc_print($pref->{color},"    $pref->{color}    ")._cc_print('X',']')."\n";
+					print  " direct connection      = ".($pref->{nexthop} ? sprintf("no, switch=0x%x",$pref->{nexthop}) : 'yes')."\n";
+					printf(" switchport of %-8s = $pref->{ph_lc}$pref->{lc_row}$pref->{lc_port}\n", "$chunk->{source}:$port");
+					print  "\n";
+				}
+			}
+		}
+		elsif($chunk->{type} eq 'matrix') {
+			
+			my %mark_h     = map( ($_,1), @{$opts->{host}} ); # quick way to fake hash ;-)
+			my @vrow_list  = reverse(0..((int(@{$ibcache->{lc_layout}})*2)-1));
+			my @vport_list = (0..(($ibcache->GetPortsPerLc/2)-1));
+			my @col_width  = map(5, @vport_list); # pre-fill width with 5 chars
+			
+			# PreCalculate col width.. :-(
+			foreach my $vrow (@vrow_list) {
+				foreach my $vcol (@vport_list) {
+					if(my $vref = $chunk->{target}->[$vrow]->[$vcol] ) {
+						my $nsize = 0;
+						map( $nsize += (length($_->{hostname})||1), @$vref );
+						$col_width[$vcol] = $nsize if $nsize > $col_width[$vcol];
+					}
+				}
+			}
+			
+			print "Guessed switch model: "._cc_print('g'," >".$ibcache->GetSwitchDescription."< ")."\n";
+			
+			print "####|"; # -> Assemble X-Row
+			foreach my $vcol (@vport_list) {
+				my $num   = sprintf("%2d",$vcol);
+				my $space = $col_width[$vcol] - length($num);
+				my $left  = int($space/2);
+				my $right = $space - $left;
+				
+				print ((" " x $left).$num.(" " x $right)."|");
+				
+				
+			}
+			print "\n";
+			
+			foreach my $vrow (@vrow_list) {
+				my $vrow_ref = ( $chunk->{target}->[$vrow] || [] );
+				my $portname = int($vrow/2).($vrow%2 ? 'A' : 'B');
+				
+				printf("%3s |",$portname); # Linecar ID (8A , 3B ...)
+				foreach my $vport (@vport_list) {
+					my $vport_ref    = ( $vrow_ref->[$vport] || [{},{},{}] );
+					my $vport_width  = $col_width[$vport];
+					my $to_display   = join("",map(_cc_print($_->{color}.($mark_h{$_->{hostname}}?'U':'').($_->{nexthop}?'G':''), ($_->{hostname}||' ')),@$vport_ref));
+					my $used_chars   = length(join("",map(($_->{hostname}||' '),@$vport_ref)));
+					# We cannot use sprintf() directly because it would get confused by escape-sequences
+					print $to_display;
+					print _cc_print(0," ") x ( $vport_width - $used_chars );
+					print "|";
+				}
+				print "\n";
+			}
+			
+		}
+		elsif($chunk->{type} eq 'txt') {
+			print $chunk->{txt}."\n";
+		}
+		else {
+			print Data::Dumper::Dumper($chunk); # better than doing nothing
+		}
+		
+	}
+	
+	
+}
+
+
+
+#################################################
+# Return memhog with full switchview
+sub build_matrix {
+	my($ibcache,$alias) = @_;
+	
+	my $memhog = [];
+	foreach my $xhostname (sort keys(%{$ibcache->{hostnames}})) {
+		foreach my $xport (sort keys(%{$ibcache->{hostnames}->{$xhostname}})) {
+
+			my $xref     = $ibcache->{hostnames}->{$xhostname}->{$xport};
+			my $sp_loc   = $ibcache->GetSwitchportLocation($xref->{switch_port});
+			my $fullguid = $ibcache->{hostid}->{$xref->{hostid}};              # GUID of connected chip
+			my $lcindex  = guid_to_lcpos($ibcache,$fullguid);                  # LineCard index for this host
+			my $swindex  = $ibcache->GetSwGuidIndex(guid_to_swchipguid($fullguid)); # Connected Switch-chip chip on LC
+			my $portidx  = (($ibcache->GetPortsPerSw/2)*$swindex)+$sp_loc->{col};
+			my $lcxoff   = ( $sp_loc->{row} eq 'A' ? 1 : 0 );
+			
+			next if $lcindex < 0; # host not found -> most likely not directly connected to same switch
+			if(!$fullguid) {
+				warn "ref $xref has no guid, skipping orphaned host\n";
+				next;
+			}
+			push(@{$memhog->[($lcindex*2)+$lcxoff]->[$portidx]}, {
+			               hostname=> ( defined($alias) ? ($alias->{$xhostname}||$xhostname) : "  "), #"XX",# defined($alias ? (uc($alias->{$xhostname}) || $xhostname) : 'X'),
+			               color=>$sp_loc->{color}, nexthop=>$xref->{nexthop} } );
+		}
+	}
+	
+	
+	return { type=>'matrix', source=>'ib', target=>$memhog };
+}
+
+#################################################
+# Discover all hosts on given port
+sub get_port {
+	my($portid,$ibcache) = @_;
+	
+	my $rv = { error=>"port '$portid' not found" };
+	
+	if($portid =~ /^(\d+)([AB])(\d+)$/) {
+		my $lc_idx = $1;      # linecard index
+		my $lc_row = uc($2);  # linecard row (A/B)
+		my $lc_col = $3;      # linecard 'port'
+		
+		my $linecard_baseid  = ($ibcache->{lc_layout}->[$lc_idx] || die "FATAL: no such linecard: $lc_idx\n");  # Base GUID of this linecard
+		my @this_cpx         = ();
+		
+		foreach my $ibhostname (keys(%{$ibcache->{hostnames}})) {
+			while( my($ibport, $xref) = each(%{$ibcache->{hostnames}->{$ibhostname}}) ) {
+				
+				my $hostid       = $xref->{hostid};                                                     # GUID of In-Host-Chip
+				my $full_guid    = $ibcache->{hostid}->{$hostid} || FAILBACK_GUID;                      # Full GUID of connected Switch-Chip
+				my $this_lcbase  = guid_to_baseguid($full_guid);                                        # Linecard Baseid of connected SwitchChip
+				my $this_swcguid = guid_to_swchipguid($full_guid);                                      # Guid of Switch-Chip (0x2a or so..)
+				my $this_swcidx  = $ibcache->GetSwGuidIndex($this_swcguid);                             # SwitchChipIndex
+				my $port_pos     = $ibcache->GetSwitchportLocation($xref->{switch_port});               # Information about this port
+				my $this_lcport  = $port_pos->{col} + ($this_swcidx * ($ibcache->GetNumSwChips-1) );    # Physical Linecard Port
+				
+				if($this_lcbase == $linecard_baseid && $this_lcport == $lc_col && $port_pos->{row} eq $lc_row ) {
+					push(@this_cpx,$ibhostname);
+				}
+				
+			}
+		}
+		
+		
+		$rv = { type   => 'portlist',
+		        info   => sprintf("port=$portid is connected to linecard %X", $linecard_baseid),
+		        target => \@this_cpx,
+		        source => $portid ,
+		      };
+		
+	}
+	return $rv;
+}
+
+
+#################################################
+# Try to find given host in ibcache
+sub get_host {
+	my($hostname,$ibcache) = @_;
+	
+	my $rv = { error=>"host '$hostname' not found" };
+	
+	if(exists($ibcache->{hostnames}->{$hostname})) {
+		my $xref = $ibcache->{hostnames}->{$hostname}; # Ref to this hostname
+		
+		my $per_port = {};
+		foreach my $hostport (keys(%$xref)) { # -> match all (found) ports of this host
+			my $this_href   = $xref->{$hostport};                                             # hashref for $this_host:$this_port info
+			my $full_guid   = ($ibcache->{hostid}->{$this_href->{hostid}} || FAILBACK_CXP);   # full guid of CXP (= chip_guid + port_guid)
+			my $sport       = $this_href->{switch_port};                                      # CXP Port
+			my $lc_guid     = guid_to_baseguid($full_guid);                                   # LineCard GUID
+			my $swc_guid    = guid_to_swchipguid($full_guid);                                 # SwitchChip GUID (0xa2 .. or whatever)
+			my $swc_index   = $ibcache->GetSwGuidIndex($swc_guid);                            # Chip index on this linecard
+			my $lc_position = guid_to_lcpos($ibcache,$full_guid);                             # Index/Positon of this linecard
+			my $port_pos    = $ibcache->GetSwitchportLocation($sport);                        # Detailed physical chip-port location/information
+			my $this_port   = $port_pos->{col} + ($swc_index * ($ibcache->GetNumSwChips-1) ); # Calculate real (frontview) port position
+			my $this_row    = $port_pos->{row};
+			my $next_hop    = $this_href->{nexthop};
+			
+			$per_port->{$hostport} = {
+			                            info    => sprintf("$hostname port=$hostport > 0x%x links to 0x%x (port=$sport)", $this_href->{hostid}, $full_guid),
+			                            lc_guid => $lc_guid, swc_idx=>$swc_index, swc_guid=>$swc_guid, ph_lc=>$lc_position, switchport=>$sport,
+			                            lc_port =>"$this_port", lc_row=>"$this_row", chip_idx=>$port_pos->{chip_idx}, color=>$port_pos->{color}, nexthop=>$next_hop,
+			                            invalid=>( $full_guid == FAILBACK_CXP ? 1 : 0 ),
+			                         }
+		}
+		
+		$rv = { type   => 'hostlist',
+		        source => $hostname,
+		        target => $per_port,
+		      }
+		
+	}
+	
+	return $rv;
+}
+
+
+sub get_short_portdesc {
+	my($get_host_target) = @_;
+	return join("\t", map( "port $_ \@ $get_host_target->{$_}->{ph_lc}$get_host_target->{$_}->{lc_row}$get_host_target->{$_}->{lc_port}", sort keys(%$get_host_target) ))
+}
+
+
+
+
+#################################################
+# Parses ibnetdiscovery -v output and creates a
+# hash with all needed information:
+# {  hostnames => $hostname => $port = { switch_port, hostid }
+#    hostids   => $hostid = switch_guid }
+sub parse_ibnetdiscover {
+	my($source) = @_;
+	my $ib_layout = {};
+	my $hopdb     = {}; # references to other switches
+	my $bref      = {};
+	my $sw_glue   = {};
+	
+	my $local_lc = {};
+	
+	# we need to get our own id because our own entry is reversed in ibnetdiscover
+	my $own_ibid = `ibv_devinfo |grep node_guid | tr -d :  | awk '{print \$2}'`;
+#	   $own_ibid =  "00212800013e51be" if $ENV{ADRIAN_DEBUG}; # M9 switch id for testing with dumps
+#	   $own_ibid =  "00212800013e40de" if $ENV{ADRIAN_DEBUG}; # a6200
+	
+	chomp($own_ibid);
+	$own_ibid = hex($own_ibid);
+	
+	if(!$source) {
+		open(IBN, "ibnetdiscover -v |") or die "Could not execute ibnetdiscover : $!\n";
+	}
+	elsif($source eq '-') {
+		*IBN = *STDIN;
+	}
+	else {
+		open(IBN, "<", $source) or die "Could not read $source : $!\n";
+	}
+	
+	my $full_buffer = join("",<IBN>);
+	close(IBN);
+	
+	# round #1: bless object and search for local switches
+	foreach(split(/\n/,$full_buffer)) {
+		if ($_ =~ /^Switch\s+\d+\s+"S-([0-9a-f]{16})"\s+# (.+\Q$opts->{forceswitch}\E.+)/) {
+			if(ref($ib_layout) eq 'HASH') {
+				   if($_ =~ /DCS 648/)     { Adrian::SUN648->new($ib_layout)      } # fixme
+				elsif($_ =~ /Infiniscale/) { Adrian::DevelSwitch->new($ib_layout) }
+				else                       { die "Unknown switch: $2\n";          }
+				debug("GUESSED SWITCHMODEL IS: $ib_layout\n");
+			}
+			$local_lc->{guid_to_baseguid(hex($1))} = 1 if int(keys(%$local_lc)) < $ib_layout->GetNumberOfLocalGuids;
+		}
+	}
+	
+	# round #2: parse hostinfo
+	foreach(split(/\n/,$full_buffer)) {
+		chomp;
+		
+		# [30]    "H-00212800013e4332"[1](212800013e4333)                 # "a6232 HCA-1" lid 75 4xQDR
+		if($_ =~ /^\[(\d+)\].+"H-([0-9a-f]{16})"\[(\d+)\]\(([0-9a-f]+)\)\s+# "(\S+) /) {
+			my($switchport,$hostid,$hostport,$unk1,$hostname) = ($1,$2,$3,$4,$5);
+			
+			debug("HOST: hostname=$hostname, port=$hostport, hostid=$hostid, switchport=$switchport, unk1=$unk1\n");
+			
+			$ib_layout->{hostnames}->{$hostname}->{$hostport} = { switch_port=>$switchport, hostid=>hex($hostid), nexthop=>0 };
+			$bref->{hex($hostid)} = $hostname;
+		}
+		# [36]    "S-0002c902004438f8"[16]                # "Infiniscale-IV Mellanox Technologies" lid 671 4xQDR
+		elsif($_ =~ /^\[(\d+)\]\s+"S-([0-9a-f]{16})"\[\d+\]\s+# (.+)/) {
+			debug("SWITCHGLUE: target_switch=$2, remote_switchport=$1\n");
+			$sw_glue->{hex($2)} = $1;
+		}
+		# ibwarn: [6438] link_ports: linking: 0x2128183f4912c2 0xb9b2210->0xb9de650:35 and 0x212800013e3ce2 0xb9de6a0->0xb9de800:1
+		elsif($_ =~ / linking: 0x([0-9a-f]+) 0x.+ and 0x([0-9a-f]+) 0x/) {
+			my @data = (hex($1),hex($2));                       # switchid <-> hostid
+			   @data = reverse(@data) if $data[0] == $own_ibid; # our own entry is reversed
+			
+			# harvest some information about this guid:
+			my($x_mac, $x_type, $x_pos, $x_dev, $x_num) = unpack("A12AAAA", sprintf("%016x",$data[0]));
+			
+			$x_type = hex($x_type);
+			$x_pos  = hex($x_pos);
+			$x_dev  = hex($x_dev);
+			
+			debug(sprintf("LINK: type=$x_type, mac=$x_mac, pos=$x_pos, dev=$x_dev, num=$x_num, link=<< %x <=> %x >>\n",@data));
+			
+			if($x_type <= 0x4) {
+				if($local_lc->{guid_to_baseguid($data[0])}) {
+					# connected to 'local' linecard
+					$ib_layout->{hostid}->{$data[1]} = $data[0];
+					$ib_layout->{lc_layout}->[$x_pos]= guid_to_baseguid($data[0]);
+				}
+				else {
+					# remote connection: add to hopdb:
+					$hopdb->{$data[1]} = $data[0];
+				}
+			}
+			elsif($x_type == 0xF) {} # Fabric Card
+			elsif($x_type == 0xA) {} # 32 Port
+			elsif($x_type == 0xB) {} # 72 Port
+			
+		}
+		
+	}
+	
+	foreach my $x_hostid (keys(%$hopdb)) {
+		my $x_remote_guid  = $hopdb->{$x_hostid}; # guid of remote switch (?)
+		my $x_local_lcguid = $ib_layout->{hostid}->{$x_remote_guid};
+		my $x_hostname     = $bref->{$x_hostid};
+		my $sglue          = $sw_glue->{$x_remote_guid};
+		$ib_layout->{hostid}->{$x_hostid} = $x_local_lcguid;
+		
+		debug(sprintf("HOSTDB: to_fixup_hostid=%x, to_fixup_hostname=$x_hostname, next_hop_switch=%x, local_lc_guid=%x, local_switch_port=$sglue\n", $x_hostid, $x_remote_guid, $x_local_lcguid));
+		
+		$ib_layout->{hostnames}->{$x_hostname}->{1}->{switch_port} = $sglue;# = { switch_port=>$switchport, hostid=>hex($hostid) };
+		$ib_layout->{hostnames}->{$x_hostname}->{1}->{nexthop} = $x_remote_guid; # fixme: port hardcoded
+	}
+	
+	foreach my $lcidx (@{$ib_layout->{lc_layout}}) {
+		debug(sprintf("LC_LAYOUT: %x\n",$lcidx));
+	}
+	
+	foreach my $local (keys(%$local_lc)) {
+		debug(sprintf("LOCAL_LC: %x\n", $local));
+	}
+	
+	return $ib_layout;
+}
+
+#################################################
+# Returns linecard index / position of a guid
+sub guid_to_lcpos {
+	my($ibcache,$guid) = @_;
+	
+	$guid = guid_to_baseguid($guid); # convert to base guid
+	
+	for(my $i=0;$i<int(@{$ibcache->{lc_layout}});$i++) {
+		return $i if $ibcache->{lc_layout}->[$i] == $guid;
+	}
+	return -1;
+}
+
+#################################################
+# Converts (linecard_guid+sw_guid) into linecard_guid (aka: base guid)
+sub guid_to_baseguid {
+	my($hex) = @_;
+	# we must zero-out the last 2 hex-chars to get the base guid
+	return (int($hex/0x100)*0x100);
+}
+
+#################################################
+# Return (raw) sw-chip id
+sub guid_to_swchipguid {
+	my($guid) = @_;
+	return ( $guid - guid_to_baseguid($guid) );
+}
+
+
+#################################################
+# Convert cablecolor-chars into ascii-escape
+# sequence
+sub _cc_print {
+	my($cc, $msg) = @_;
+	my $acode = "47"; # grey -> unknown
+	   $acode = "43" if $cc =~ /y/;
+	   $acode = "41" if $cc =~ /r/;
+	   $acode = "42" if $cc =~ /g/;
+	   $acode = "46" if $cc =~ /b/;
+	
+	my $uline  = ( $cc =~ /U/ ? "4;" : "" );
+	   $uline .= ( $cc =~ /G/ ? "1;" : "" );
+	
+	my $str   = "\x1b[${uline}30m\x1b[${acode}m";
+	   $str  .= $msg;
+	   $str  .= "\x1b[0m"; # switch back to defaults
+	return $str;
+}
+
+#################################################
+# Ugly hack to get the physical location of a host
+sub _reverse_hack {
+	my $hackomatic = {};
+	open(XXX, "<", "/etc/hosts") or return $hackomatic;
+	while(<XXX>) {
+		chomp;
+		if($_ =~ /hpc-net\.ethz\.ch\s+(a\d+)\s+(a\d+n\d+)/) {
+			$hackomatic->{lc($1)} = uc($2);
+		}
+	}
+	close(XXX);
+	return $hackomatic;
+}
+
+
+sub debug {
+	print "$_[0]" if $opts->{debug};
+}
+
+
+
+
+
+package Adrian::SUN648;
+	
+	sub new {
+		my($class,$tobless) = @_;
+		bless($tobless,$class);
+		return $tobless;
+	}
+	
+	
+	sub GetPortsPerLc {
+		return 24;
+	}
+	
+	sub GetPortsPerSw {
+		return 6;
+	}
+	
+	sub GetNumSwChips {
+		my($self) = @_;
+		return ( $self->GetPortsPerLc / $self->GetPortsPerSw );
+	}
+	
+	sub GetSwNumOff {
+		return 19;
+	}
+	
+	sub GetNumberOfLocalGuids {
+		return 18; # LCs and FCs
+	}
+	
+	sub GetSwitchportLocation {
+		my($self, $sport) = @_;
+		
+		$sport        -= $self->GetSwNumOff;
+		my $swc_col    = int( $sport / $self->GetPortsPerSw ); # col of THIS CHIP (0-3)
+		my $onchip_idx = $sport % $self->GetPortsPerSw;
+		
+		# on-chip-port map:
+		my @nlayout = ( {l=>'B',c=>'r'}, {l=>'A',c=>'r'},{l=>'A',c=>'y'},{l=>'A',c=>'b'},{l=>'B',c=>'y'},{l=>'B',c=>'b'} );  # Normal chip layout
+		my @llayout = ( {l=>'B',c=>'b'}, {l=>'B',c=>'y'},{l=>'A',c=>'b'},{l=>'A',c=>'y'},{l=>'A',c=>'r'},{l=>'B',c=>'r'} );  # layout of the last chip
+		my $chipref = ( ($swc_col+1) == ($self->GetPortsPerSw/2) ? $llayout[$onchip_idx] : $nlayout[$onchip_idx] );
+		
+		return ( { col=>$swc_col, row=>$chipref->{l}, chip_idx=>$onchip_idx, color=>$chipref->{c} } );
+	}
+	
+	#################################################
+	# Converts a switchport-hex-id to int
+	# 0xa2 = 0
+	# 0xb2 = 1 ...
+	sub GetSwGuidIndex {
+		my($self,$swportnum) = @_;
+		return ( ($swportnum - 0xa2) / 0x10 );
+	}
+	
+	
+	sub GetSwitchDescription {
+		return "Oracle(R)(TM) 648(R) QDR(R) Switch";
+	}
+
+1;
+
+package Adrian::DevelSwitch;
+	sub new {
+		my($class,$tobless) = @_;
+		bless($tobless,$class);
+		return $tobless;
+	}
+	sub GetPortsPerLc {
+		return 36;
+	}
+	
+	sub GetPortsPerSw {
+		return 1;
+	}
+	
+	sub GetNumberOfLocalGuids {
+		return 1; # only one LC
+	}
+	
+	sub GetNumSwChips {
+		my($self) = @_;
+		return ( $self->GetPortsPerLc / $self->GetPortsPerSw );
+	}
+	
+	sub GetSwNumOff {
+		return 1;
+	}
+	
+	sub GetSwitchportLocation {
+		my($self, $sport) = @_;
+		
+		$sport        -= $self->GetSwNumOff;
+		my $swc_col    = int( $sport / $self->GetPortsPerSw ); # col of THIS CHIP (0-3)
+		my $onchip_idx = $sport % $self->GetPortsPerSw;
+		
+		# on-chip-port map:
+		my @nlayout = ( {l=>'B',c=>'r'}, {l=>'A',c=>'r'},{l=>'A',c=>'y'},{l=>'A',c=>'b'},{l=>'B',c=>'y'},{l=>'B',c=>'b'} );  # Normal chip layout
+		my @llayout = ( {l=>'B',c=>'b'}, {l=>'B',c=>'y'},{l=>'A',c=>'b'},{l=>'A',c=>'y'},{l=>'A',c=>'r'},{l=>'B',c=>'r'} );  # layout of the last chip
+		my $chipref = ( ($swc_col+1) == ($self->GetPortsPerSw/2) ? $llayout[$onchip_idx] : $nlayout[$onchip_idx] );
+		
+		return ( { col=>$swc_col, row=>$chipref->{l}, chip_idx=>$onchip_idx, color=>$chipref->{c} } );
+	}
+	
+	sub GetSwGuidIndex {
+		my($self,$swportnum) = @_;
+		return ( $swportnum - 0x40 ); # ???
+	}
+	
+	sub GetSwitchDescription {
+		return "Development Switch";
+	}
+	
+1;
