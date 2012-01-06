@@ -4,7 +4,7 @@
 #
 # Try to match card <-> ibswitch_port
 #
-# (C) 2010 Adrian Ulrich / ETH Zurich
+# (C) 2010-2012 Adrian Ulrich / ETH Zurich
 #
 #
 # Changelog:
@@ -17,6 +17,8 @@
 # 2010-09-10   Adrian  : Relaxed parser regexp (for CentOS 5.5)
 # 2010-09-27   Adrian  : Added --dumphosts option
 # 2011-08-18   Adrian  : Add support for multiple switches on same network (VERY alpha!)
+# 2012-01-06   Adrian  : Added --forceswitch option
+#                        Ignore 'orphaned' hosts if the switch detection failed badly
 
 use strict;
 use Getopt::Long;
@@ -24,7 +26,7 @@ use Data::Dumper;
 
 use constant FAILBACK_GUID => 0xb4df00d00;
 use constant FAILBACK_CXP  => 0xb4df00d;
-use constant VERSIONINFO   => 'ibq 0.90 - (C) 2010-2011 Adrian Ulrich / ETH Zurich';
+use constant VERSIONINFO   => 'ibq 0.92 - (C) 2010-2011 Adrian Ulrich / ETH Zurich';
 
 
 my $opts      = {};
